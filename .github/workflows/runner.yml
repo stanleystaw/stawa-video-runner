@@ -45,18 +45,21 @@ jobs:
     steps:
       - name: Lecture des paramètres (masquage immédiat)
         id: task
-        env:
-          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          TASK_ID="$(echo "$PAYLOAD" | jq -r '.task_id // empty')"
-          VIDEO_URL="$(echo "$PAYLOAD" | jq -r '.video_url // empty')"
-          PROXY_URL="$(echo "$PAYLOAD" | jq -r '.proxy_url // empty')"
-          KIND="$(echo "$PAYLOAD" | jq -r '.kind // "full"')"
+          # ── SÉCURITÉ DÉPÔT PUBLIC ──
+          # Le payload est lu depuis le fichier d'événement du RUNNER
+          # ($GITHUB_EVENT_PATH) : AUCUNE interpolation {{ }} ni variable
+          # d'environnement affichable ne contient les données de la tâche.
+          # (GitHub affiche les blocs env: des étapes dans les logs publics :
+          # ne JAMAIS y placer le payload brut avant le masquage.)
+          TASK_ID="$(jq -r '.client_payload.task_id // empty' "$GITHUB_EVENT_PATH")"
+          VIDEO_URL="$(jq -r '.client_payload.video_url // empty' "$GITHUB_EVENT_PATH")"
+          PROXY_URL="$(jq -r '.client_payload.proxy_url // empty' "$GITHUB_EVENT_PATH")"
+          KIND="$(jq -r '.client_payload.kind // "full"' "$GITHUB_EVENT_PATH")"
           if [ -z "$TASK_ID" ] || [ -z "$VIDEO_URL" ]; then
             echo "::error::Payload incomplet (task_id / video_url requis)"; exit 1
           fi
-          # ── SÉCURITÉ DÉPÔT PUBLIC : masquage avant toute utilisation ──
           echo "::add-mask::$TASK_ID"
           echo "::add-mask::$VIDEO_URL"
           if [ -n "$PROXY_URL" ]; then echo "::add-mask::$PROXY_URL"; fi
