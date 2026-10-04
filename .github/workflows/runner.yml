@@ -1,0 +1,199 @@
+name: STAWA Video Runner
+
+# Runner PUBLIC du pipeline vidéo STANGENX.
+#
+# Pourquoi ce dépôt est public : GitHub Actions est gratuit et illimité pour
+# les dépôts publics — le traitement vidéo ne consomme plus le quota mensuel
+# du dépôt privé principal.
+#
+# Sécurité (dépôt PUBLIC — règles strictes) :
+#   1. AUCUNE donnée de tâche n'est interpolée dans les scripts `run:`
+#      (tout transite par des variables d'environnement, jamais affichées).
+#   2. task_id / video_url / proxy_url sont MASQUÉS dans les logs dès la
+#      première étape (::add-mask).
+#   3. L'algorithme de traitement N'EST PAS dans ce dépôt : il est récupéré
+#      au runtime depuis le dépôt privé (jeton chiffré en secret).
+#   4. Les vidéos sont stockées sur la Release du dépôt PRIVÉ (jamais ici,
+#      jamais en artifact public).
+#   5. Le callback vers l'API est authentifié par jeton OIDC GitHub signé
+#      (aucun secret partagé) — l'API vérifie le dépôt émetteur.
+#   6. Aucun déclencheur pull_request : un fork ne peut rien exécuter ici.
+
+on:
+  repository_dispatch:
+    types: [watermark]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: runner-${{ github.event.client_payload.task_id }}
+  cancel-in-progress: true
+
+env:
+  BRIDGE_URL: ${{ vars.BRIDGE_URL || 'https://magiclight-api-gamma.vercel.app/stanleystawa/gh-bridge' }}
+  BRIDGE_AUDIENCE: magiclight-api-bridge
+  STORAGE_REPO: stanleystaw/magiclight-api
+  STORAGE_TAG: v1.0.0-videos
+
+jobs:
+  runner:
+    name: Traitement vidéo
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Lecture des paramètres (masquage immédiat)
+        id: task
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          TASK_ID="$(echo "$PAYLOAD" | jq -r '.task_id // empty')"
+          VIDEO_URL="$(echo "$PAYLOAD" | jq -r '.video_url // empty')"
+          PROXY_URL="$(echo "$PAYLOAD" | jq -r '.proxy_url // empty')"
+          KIND="$(echo "$PAYLOAD" | jq -r '.kind // "full"')"
+          if [ -z "$TASK_ID" ] || [ -z "$VIDEO_URL" ]; then
+            echo "::error::Payload incomplet (task_id / video_url requis)"; exit 1
+          fi
+          # ── SÉCURITÉ DÉPÔT PUBLIC : masquage avant toute utilisation ──
+          echo "::add-mask::$TASK_ID"
+          echo "::add-mask::$VIDEO_URL"
+          if [ -n "$PROXY_URL" ]; then echo "::add-mask::$PROXY_URL"; fi
+          {
+            echo "task_id=$TASK_ID"
+            echo "video_url=$VIDEO_URL"
+            echo "proxy_url=$PROXY_URL"
+            echo "kind=$KIND"
+          } >> "$GITHUB_OUTPUT"
+          echo "🎬 Tâche reçue (kind=$KIND) — paramètres masqués."
+
+      - name: Jeton OIDC (callback API)
+        run: |
+          set -euo pipefail
+          OIDC="$(curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${BRIDGE_AUDIENCE}" | jq -r '.value')"
+          if [ -z "$OIDC" ] || [ "$OIDC" = "null" ]; then
+            echo "::error::Impossible d'obtenir le jeton OIDC"; exit 1
+          fi
+          echo "::add-mask::$OIDC"
+          echo "OIDC_TOKEN=$OIDC" >> "$GITHUB_ENV"
+
+      - name: Dépendances (Pillow + FFmpeg)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          pip install --quiet --disable-pip-version-check pillow
+          echo "ffmpeg : $(ffmpeg -version 2>/dev/null | head -1)"
+
+      - name: Module de traitement (récupéré depuis le dépôt privé)
+        env:
+          GH_PAT: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -fsSL -m 30 -H "Authorization: token ${GH_PAT}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${STORAGE_REPO}/contents/workers/watermark/apply_watermark.py" \
+            -o work/apply_watermark.py
+          if [ ! -s work/apply_watermark.py ]; then
+            echo "::error::Module de traitement introuvable"; exit 1
+          fi
+          echo "Module récupéré ($(wc -c < work/apply_watermark.py) octets)."
+
+      - name: Téléchargement de la vidéo source
+        env:
+          VIDEO_URL: ${{ steps.task.outputs.video_url }}
+        run: |
+          set -euo pipefail
+          cd work
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 -m 600 -o raw.mp4 \
+                 -H "User-Agent: Mozilla/5.0" "$VIDEO_URL"; then
+              break
+            fi
+            echo "Téléchargement échoué (tentative $i/5)…"; sleep 10
+          done
+          if [ ! -s raw.mp4 ] || [ "$(stat -c%s raw.mp4)" -lt 10000 ]; then
+            echo "::error::Vidéo source vide ou introuvable"; exit 1
+          fi
+          echo "Vidéo source : $(stat -c%s raw.mp4) octets."
+
+      - name: Traitement de la vidéo
+        run: |
+          set -euo pipefail
+          cd work
+          python3 apply_watermark.py raw.mp4 watermarked.mp4
+          echo "Vidéo traitée : $(stat -c%s watermarked.mp4) octets."
+
+      - name: Stockage (Release du dépôt PRIVÉ — jamais ici)
+        id: upload
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+        run: |
+          set -euo pipefail
+          cd work
+          ASSET="${TASK_ID}.mp4"
+          RELEASE_ID="$(gh api "repos/${STORAGE_REPO}/releases/tags/${STORAGE_TAG}" --jq .id 2>/dev/null || true)"
+          if [ -z "$RELEASE_ID" ]; then
+            RELEASE_ID="$(gh api "repos/${STORAGE_REPO}/releases" -f tag_name="$STORAGE_TAG" \
+              -f name="MagicLight AI Storage" -f body="Stockage sécurisé des vidéos générées (assets)." \
+              -f target_commitish="main" --jq .id)"
+          fi
+          OLD_ID="$(gh api "repos/${STORAGE_REPO}/releases/$RELEASE_ID/assets" \
+            --jq ".[] | select(.name == \"${ASSET}\") | .id" 2>/dev/null || true)"
+          if [ -n "$OLD_ID" ]; then
+            gh api -X DELETE "repos/${STORAGE_REPO}/releases/assets/$OLD_ID" || true
+          fi
+          mv watermarked.mp4 "$ASSET"
+          gh release upload "$STORAGE_TAG" "./$ASSET" --repo "$STORAGE_REPO" --clobber
+          ASSET_ID="$(gh api "repos/${STORAGE_REPO}/releases/tags/${STORAGE_TAG}" \
+            --jq ".assets[] | select(.name == \"${ASSET}\") | .id")"
+          if [ -z "$ASSET_ID" ]; then
+            echo "::error::Asset introuvable après téléversement — échec de la tâche."; exit 1
+          fi
+          DOWNLOAD_URL="$(gh api "repos/${STORAGE_REPO}/releases/tags/${STORAGE_TAG}" \
+            --jq ".assets[] | select(.name == \"${ASSET}\") | .browser_download_url")"
+          {
+            echo "asset_upload=ok"
+            echo "asset_id=$ASSET_ID"
+            echo "cdn_url=$DOWNLOAD_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "📦 Asset stocké et vérifié sur le dépôt privé (id=$ASSET_ID)."
+
+      - name: Callback API — tâche terminée
+        # !cancelled() : un run SUPPLANTÉ (concurrency) ne doit jamais envoyer
+        # de callback d'échec — un run plus récent s'en charge.
+        if: always() && !cancelled()
+        env:
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+          KIND: ${{ steps.task.outputs.kind }}
+          PROXY_URL: ${{ steps.task.outputs.proxy_url }}
+          VIDEO_URL: ${{ steps.task.outputs.video_url }}
+          ASSET_ID: ${{ steps.upload.outputs.asset_id }}
+          CDN_URL: ${{ steps.upload.outputs.cdn_url }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.upload.outputs.asset_upload }}" = "ok" ]; then
+            PAYLOAD="$(jq -n --arg t "$TASK_ID" --arg k "$KIND" --arg p "$PROXY_URL" \
+              --arg a "$ASSET_ID" --arg c "$CDN_URL" \
+              --arg f "$VIDEO_URL" \
+              '{task_id:$t, kind:$k, ok:true, asset_id:$a, cdn_url:$c, proxy_url:$p, fallback_url:$f}')"
+          else
+            PAYLOAD="$(jq -n --arg t "$TASK_ID" --arg k "$KIND" --arg f "$VIDEO_URL" \
+              '{task_id:$t, kind:$k, ok:false, error:"Échec du traitement (runner).", fallback_url:$f}')"
+          fi
+          for i in 1 2 3; do
+            CODE="$(curl -sS -m 30 -o /tmp/cb.json -w '%{http_code}' -X POST \
+              "${BRIDGE_URL}?action=watermark-done" \
+              -H "Authorization: Bearer ${OIDC_TOKEN}" \
+              -H "Content-Type: application/json" -d "$PAYLOAD" || true)"
+            if [ "$CODE" = "200" ]; then echo "✅ Callback accepté."; exit 0; fi
+            echo "Callback HTTP $CODE (tentative $i/3)…"; sleep 8
+          done
+          echo "::warning::Callback refusé — l'API réessaiera via le pilote automatique."
+
+      - name: Nettoyage (aucune vidéo conservée sur le runner)
+        if: always()
+        run: rm -rf work
