@@ -1,0 +1,95 @@
+name: STAWA Video Sweeper
+
+# Balayeur du double système : interroge l'API (via OIDC, aucun secret partagé)
+# toutes les 5 minutes pour RÉCUPÉRER les tâches prêtes pour le filigrane,
+# puis dispatch le runner pour chacune.
+#
+# Garantie : la livraison ne dépend plus du dispatch push depuis Vercel
+# (jeton GitHub côté Vercel périmé) — si le push fonctionne, le balayeur
+# ne trouve rien (les tâches partent instantanément) ; sinon, il prend le
+# relais en ≤ 5 minutes.
+#
+# Sécurité : aucune donnée de tâche n'est affichée dans les logs (compteurs
+# et codes HTTP uniquement) ; le jeton du dépôt privé reste un secret masqué.
+
+on:
+  schedule:
+    # Hors :00/:30 (minutes de congestion GitHub où les crons sont retardés).
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sweeper
+  cancel-in-progress: true
+
+env:
+  BRIDGE_URL: ${{ vars.BRIDGE_URL || 'https://magiclight-api-gamma.vercel.app/stanleystawa/gh-bridge' }}
+  BRIDGE_AUDIENCE: magiclight-api-bridge
+  RUNNER_REPO: stanleystaw/stawa-video-runner
+
+jobs:
+  sweep:
+    name: Balayage des tâches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Jeton OIDC
+        run: |
+          set -euo pipefail
+          OIDC="$(curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${BRIDGE_AUDIENCE}" | jq -r '.value')"
+          if [ -z "$OIDC" ] || [ "$OIDC" = "null" ]; then
+            echo "::error::Impossible d'obtenir le jeton OIDC"; exit 1
+          fi
+          echo "::add-mask::$OIDC"
+          echo "OIDC_TOKEN=$OIDC" >> "$GITHUB_ENV"
+
+      - name: Interrogation de l'API (tâches prêtes)
+        id: poll
+        run: |
+          set -euo pipefail
+          CODE="$(curl -sS -m 30 -o /tmp/poll.json -w '%{http_code}' -X POST \
+            "${BRIDGE_URL}?action=watermark-poll" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" -d '{}' || true)"
+          if [ "$CODE" != "200" ]; then
+            echo "API HTTP $CODE — arrêt du balayage."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          COUNT="$(jq -r '.count // 0' /tmp/poll.json)"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          jq -c '.tasks // []' /tmp/poll.json > /tmp/tasks.json
+          if [ "$COUNT" = "0" ]; then echo "Rien à traiter."; else echo "📋 $COUNT tâche(s) prête(s)."; fi
+
+      - name: Dispatch du runner pour chaque tâche
+        if: steps.poll.outputs.count != '0'
+        env:
+          GH_PAT: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          N=0; OK=0
+          while IFS= read -r task; do
+            N=$((N + 1))
+            PAYLOAD="$(jq -c '{
+              event_type: "watermark",
+              client_payload: {
+                task_id: .task_id,
+                video_url: .video_url,
+                proxy_url: .proxy_url,
+                kind: .kind
+              }
+            }' <<< "$task")"
+            CODE="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -X POST \
+              "https://api.github.com/repos/${RUNNER_REPO}/dispatches" \
+              -H "Authorization: token ${GH_PAT}" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" || true)"
+            if [ "$CODE" = "204" ]; then OK=$((OK + 1)); fi
+            echo "  → tâche $N/$COUNT : dispatch HTTP $CODE"
+          done < <(jq -c '.[]' /tmp/tasks.json)
+          echo "✅ $OK/$N dispatch(s) envoyé(s) au runner."
