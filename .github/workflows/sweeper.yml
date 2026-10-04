@@ -70,6 +70,7 @@ jobs:
         if: steps.poll.outputs.count != '0'
         env:
           GH_PAT: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          COUNT: ${{ steps.poll.outputs.count }}
         run: |
           set -euo pipefail
           N=0; OK=0
