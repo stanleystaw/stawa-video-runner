@@ -17,6 +17,15 @@ on:
     # Hors :00/:30 (minutes de congestion GitHub où les crons sont retardés).
     - cron: "2-57/5 * * * *"
   workflow_dispatch: {}
+  # ── CASCADE ──
+  # GitHub throttle fortement les crons (constaté : ~4 exécutions/24 h au
+  # lieu de 288). Ce déclencheur contourne la limite : dès que le RUNNER
+  # termine une tâche, le balayeur se relance — s'il reste des tâches
+  # coincées, il les dispatch et la chaîne continue d'elle-même jusqu'à
+  # ce qu'il n'y ait plus rien à traiter.
+  workflow_run:
+    workflows: ["STAWA Video Runner"]
+    types: [completed]
 
 permissions:
   contents: read
